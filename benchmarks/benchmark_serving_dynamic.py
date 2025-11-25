@@ -25,6 +25,7 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+
 try:
     import pynvml
     _NVML_OK = True
@@ -33,17 +34,10 @@ except Exception:
 
 @dataclass
 class PowerSample:
-    t: float      # seconds since epoch (time.time())
+    t: float      # seconds since epoch
     watts: float  # sum across GPUs
 
-
 class GpuPowerLogger:
-    """
-    Async-friendly GPU wall-power sampler using NVML.
-    - Samples total GPU power (sum over all visible GPUs) at `interval_s`.
-    - Call `start()`, run your work, then `stop()` to finalize.
-    - Use `energy_joules()` to get integrated energy; can subtract idle baseline.
-    """
     def __init__(self, interval_s: float = 0.1):
         self.interval_s = interval_s
         self._running = False
@@ -52,6 +46,8 @@ class GpuPowerLogger:
         self._gpu_handles = None
         self._t0: Optional[float] = None
         self._t1: Optional[float] = None
+        self.max_power : int = None
+        self.min_power: int = None
 
     def _init_nvml(self):
         if not _NVML_OK:
@@ -59,6 +55,8 @@ class GpuPowerLogger:
         pynvml.nvmlInit()
         n = pynvml.nvmlDeviceGetCount()
         self._gpu_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(n)]
+        self.min_power = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(self._gpu_handles[0])[0] / 1000.0
+        self.max_power = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(self._gpu_handles[0])[1] / 1000.0
 
     def _shutdown_nvml(self):
         try:
@@ -69,7 +67,6 @@ class GpuPowerLogger:
     def _read_total_watts(self) -> float:
         total_mw = 0
         for h in self._gpu_handles:
-            # powerUsage is milliwatts; some GPUs may report 0 when idle/off
             total_mw += pynvml.nvmlDeviceGetPowerUsage(h)
         return total_mw / 1000.0
 
@@ -80,10 +77,8 @@ class GpuPowerLogger:
             try:
                 w = self._read_total_watts()
             except Exception:
-                # If a transient NVML error occurs, skip this sample
                 w = self.samples[-1].watts if self.samples else 0.0
             self.samples.append(PowerSample(t=now, watts=w))
-            # sleep the remainder of interval accounting for sampling cost
             await asyncio.sleep(self.interval_s)
         self._t1 = time.time()
 
@@ -112,26 +107,24 @@ class GpuPowerLogger:
         return max(0.0, t1 - self._t0)
 
     def energy_joules(self, idle_watts: float = 0.0) -> float:
-        """
-        Trapezoidal integrate (W * s) minus idle baseline.
-        """
         if len(self.samples) < 2:
+            print(f"energy_joules: len(self.samples) < 2 ({len(self.samples)})")
             return 0.0
         e = 0.0
         for a, b in zip(self.samples, self.samples[1:]):
             dt = b.t - a.t
             w_avg = 0.5 * (a.watts + b.watts)
             e += w_avg * dt
-        # subtract idle baseline over the same duration
         e -= idle_watts * self.duration_s()
         return max(0.0, e)
 
     def avg_watts(self) -> float:
         d = self.duration_s()
         if d <= 0 or len(self.samples) < 2:
+            print(f"avg_watts: d <= 0 ({d}) or len(self.samples) < 2 ({len(self.samples)})")
             return 0.0
-        # Use integrated energy / duration for robustness
-        return self.energy_joules(idle_watts=0.0) / d
+        return self.energy_joules() / d
+
 
 @dataclass
 class BenchmarkMetrics:
@@ -171,6 +164,7 @@ def sample_sharegpt_requests(
     # Only keep the first two turns of each conversation.
     dataset = [(data["conversations"][0]["value"],
                 data["conversations"][1]["value"]) for data in dataset]
+    print(f"Loaded {len(dataset)} conversations from {dataset_path}.")
 
     # Shuffle the dataset.
     random.shuffle(dataset)
@@ -398,6 +392,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
+    print(f'length of input requests: {len(input_requests)}')
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
     test_input = RequestFuncInput(
         model=model_id,
@@ -431,7 +426,6 @@ async def benchmark(
 
     print(f"Traffic request rate: {request_rate}")
 
-    idle_watts = 0.0
     gpu_logger = GpuPowerLogger(interval_s=0.1)
     await gpu_logger.start()
 
@@ -483,10 +477,67 @@ async def benchmark(
         tokenizer=tokenizer,
     )
 
-    E_j = gpu_logger.energy_joules(idle_watts=idle_watts)
+    E_j = gpu_logger.energy_joules()
     avg_w = gpu_logger.avg_watts()
-    j_per_token = (E_j / metrics.total_output) if metrics.total_output > 0 else float('nan')
-    w_per_token = (avg_w / metrics.total_output) if (metrics.total_output > 0 and benchmark_duration > 0) else float('nan')
+
+    overall_j_per_token = (
+        E_j / metrics.total_output if metrics.total_output > 0 else float("nan")
+    )
+    overall_w_per_token = (
+        avg_w / metrics.total_output if metrics.total_output > 0 else float("nan")
+    )
+
+    prefill_time_sum = 0.0
+    decode_time_sum = 0.0
+
+    for out, out_len in zip(outputs, actual_output_lens):
+        if not out.success or out_len <= 0:
+            continue
+
+        ttft = getattr(out, "ttft", None)
+        lat = getattr(out, "latency", None)
+        if ttft is None or lat is None:
+            continue
+        if ttft <= 0.0 or lat <= ttft:
+            continue
+
+        prefill_time_sum += ttft
+        decode_time_sum += (lat - ttft)
+
+    total_phase_time = prefill_time_sum + decode_time_sum
+    if total_phase_time > 0.0:
+        prefill_fraction = prefill_time_sum / total_phase_time
+        decode_fraction = decode_time_sum / total_phase_time
+        prefill_energy_j = E_j * prefill_fraction
+        decode_energy_j = E_j * decode_fraction
+    else:
+        prefill_fraction = 0.0
+        decode_fraction = 0.0
+        prefill_energy_j = 0.0
+        decode_energy_j = 0.0
+
+    prefill_tokens = sum(1 for l in actual_output_lens if l > 0)
+
+    decode_tokens = metrics.total_output - prefill_tokens
+    if decode_tokens < 0:
+        decode_tokens = 0
+
+    prefill_j_per_token = (
+        prefill_energy_j / prefill_tokens if prefill_tokens > 0 else float("nan")
+    )
+    decode_j_per_token = (
+        decode_energy_j / decode_tokens if decode_tokens > 0 else float("nan")
+    )
+
+    if gpu_logger.samples:
+        t0 = gpu_logger.samples[0].t
+        gpu_times = [s.t - t0 for s in gpu_logger.samples]
+        gpu_powers = [s.watts for s in gpu_logger.samples]
+        total_trace_duration = gpu_times[-1] - gpu_times[0]
+        prefill_end_t = gpu_times[0] + prefill_fraction * total_trace_duration
+    else:
+        gpu_times, gpu_powers = [], []
+        prefill_end_t = 0.0
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -519,10 +570,21 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("=" * 50)
 
-    print("{:<40} {:<10.2f}".format("Energy per token (joules/token):", j_per_token))
-    print("{:<40} {:<10.2f}".format("Power per token (watts/token):", w_per_token))
-    print("{:<40} {:<10.2f}".format("Energy (joules):", E_j))
-    print("{:<40} {:<10.2f}".format("Power (watts):", avg_w))
+    print("{s:{c}^{n}}".format(s=" GPU Energy / Power ", n=50, c="="))
+    print("{:<40} {:<10.4f}".format("Overall J per output token:", overall_j_per_token))
+    print("{:<40} {:<10.4f}".format("Overall W per output token:", overall_w_per_token))
+    print("{:<40} {:<10.2f}".format("Total energy (J):", E_j))
+    print("{:<40} {:<10.2f}".format("Average power (W):", avg_w))
+
+    print("{s:{c}^{n}}".format(s=" Prefill vs Decoding (approx) ", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Prefill energy (J, est.):", prefill_energy_j))
+    print("{:<40} {:<10.2f}".format("Decode energy (J, est.):", decode_energy_j))
+    print("{:<40} {:<10}".format("Prefill tokens:", prefill_tokens))
+    print("{:<40} {:<10}".format("Decode tokens:", decode_tokens))
+    print("{:<40} {:<10.4f}".format("Prefill J per token:", prefill_j_per_token))
+    print("{:<40} {:<10.4f}".format("Decode J per token:", decode_j_per_token))
+    
+    print(f"Power Limits: Min={gpu_logger.min_power} W, Max={gpu_logger.max_power} W")
 
     result = {
         "duration": benchmark_duration,
