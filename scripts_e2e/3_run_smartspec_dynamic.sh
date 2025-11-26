@@ -13,10 +13,7 @@ export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/nvjitli
 # pgrep -f 'api_server' | xargs kill -9
 
 gpu_id=0
-gpu_memory_utilizations=(0.9)
-
-# gpu_id=0,1
-# gpu_memory_utilizations=(0.85)
+gpu_memory_utilizations=(0.8)
 
 gpu_count=$(echo "$gpu_id" | awk -F, '{print NF}')
 draft_models=(JackFram/llama-160m)
@@ -28,7 +25,7 @@ rate_change_interval=1
 # duration=60
 # num_prompt=630
 #读取csv文件获取request_rates
-duration=31
+duration=15
 scale=1
 req_rates_csv='../benchmarks/adaspec/traces/AzureLLMInferenceTrace_conv_1week.csv'  
 request_rates=(     $(tail -n +2 "$req_rates_csv" | \
@@ -52,8 +49,8 @@ echo "avg request rate: $((num_prompt / duration))"
 
 num_speculative_tokens=(10)
 max_num_seqs=(256)
-dataset_path=../benchmarks/adaspec/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
-dataset_name=sharegpt
+dataset_path=./dataset/sharegpt_prompt_gt10x_generated.json
+dataset_name=p10g
 repeats=3
 
 proposal_len_selection_policys=('servespec')

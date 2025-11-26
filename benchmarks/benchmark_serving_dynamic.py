@@ -106,9 +106,18 @@ class GpuPowerLogger:
         t1 = self._t1 if self._t1 is not None else time.time()
         return max(0.0, t1 - self._t0)
 
+    def split_samples(self, prefill_ts):
+        idx = len(self.samples)
+        for i, s in enumerate(self.samples):
+            if s.t > prefill_ts:
+                idx = i
+                break
+        prefill_samples = self.samples[:idx]
+        decode_samples = self.samples[idx:]
+        return prefill_samples, decode_samples
+
     def energy_joules(self, idle_watts: float = 0.0) -> float:
         if len(self.samples) < 2:
-            print(f"energy_joules: len(self.samples) < 2 ({len(self.samples)})")
             return 0.0
         e = 0.0
         for a, b in zip(self.samples, self.samples[1:]):
@@ -121,7 +130,6 @@ class GpuPowerLogger:
     def avg_watts(self) -> float:
         d = self.duration_s()
         if d <= 0 or len(self.samples) < 2:
-            print(f"avg_watts: d <= 0 ({d}) or len(self.samples) < 2 ({len(self.samples)})")
             return 0.0
         return self.energy_joules() / d
 
@@ -314,8 +322,9 @@ def calculate_metrics(
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
-) -> Tuple[BenchmarkMetrics, List[int]]:
+) -> Tuple[BenchmarkMetrics, List[int], List[int]]:
     actual_output_lens: List[int] = []
+    actual_input_lens: List[int] = []
     total_input = 0
     completed = 0
     itls: List[float] = []
@@ -331,6 +340,7 @@ def calculate_metrics(
                 tokenizer(outputs[i].generated_text,
                           add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
+            actual_input_lens.append(input_requests[i][1])
             total_input += input_requests[i][1]
             if output_len > 1:
                 tpots.append(
@@ -340,6 +350,7 @@ def calculate_metrics(
             completed += 1
         else:
             actual_output_lens.append(0)
+            actual_input_lens.append(input_requests[i][1])
 
     if completed == 0:
         warnings.warn(
@@ -368,7 +379,7 @@ def calculate_metrics(
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
     )
 
-    return metrics, actual_output_lens
+    return metrics, actual_output_lens, actual_input_lens
 
 
 async def benchmark(
@@ -470,7 +481,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics, actual_output_lens, actual_input_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -481,16 +492,28 @@ async def benchmark(
     avg_w = gpu_logger.avg_watts()
 
     overall_j_per_token = (
-        E_j / metrics.total_output if metrics.total_output > 0 else float("nan")
+        E_j / (metrics.total_output + metrics.total_input) if (metrics.total_output + metrics.total_input) > 0 else float("nan")
     )
     overall_w_per_token = (
-        avg_w / metrics.total_output if metrics.total_output > 0 else float("nan")
+        avg_w / (metrics.total_output + metrics.total_input) if (metrics.total_output + metrics.total_input) > 0 else float("nan")
     )
 
     prefill_time_sum = 0.0
     decode_time_sum = 0.0
 
-    for out, out_len in zip(outputs, actual_output_lens):
+    big_inp_litl_out_counter = 0
+    litl_inp_big_out_counter = 0
+
+    cumulative_prompt_len = sum(actual_output_lens)
+    cumulative_generated_len = sum(actual_input_lens)
+
+    for out, out_len, inp_len in zip(outputs, actual_output_lens, actual_input_lens):
+        print(f"inp_len = {inp_len}, out_len = {out_len}")
+        if inp_len >= out_len*10:
+            big_inp_litl_out_counter += 1
+        if out_len >= inp_len*10:
+            litl_inp_big_out_counter += 1
+
         if not out.success or out_len <= 0:
             continue
 
@@ -529,16 +552,6 @@ async def benchmark(
         decode_energy_j / decode_tokens if decode_tokens > 0 else float("nan")
     )
 
-    if gpu_logger.samples:
-        t0 = gpu_logger.samples[0].t
-        gpu_times = [s.t - t0 for s in gpu_logger.samples]
-        gpu_powers = [s.watts for s in gpu_logger.samples]
-        total_trace_duration = gpu_times[-1] - gpu_times[0]
-        prefill_end_t = gpu_times[0] + prefill_fraction * total_trace_duration
-    else:
-        gpu_times, gpu_powers = [], []
-        prefill_end_t = 0.0
-
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
@@ -571,8 +584,8 @@ async def benchmark(
     print("=" * 50)
 
     print("{s:{c}^{n}}".format(s=" GPU Energy / Power ", n=50, c="="))
-    print("{:<40} {:<10.4f}".format("Overall J per output token:", overall_j_per_token))
-    print("{:<40} {:<10.4f}".format("Overall W per output token:", overall_w_per_token))
+    print("{:<40} {:<10.4f}".format("Overall J per token:", overall_j_per_token))
+    print("{:<40} {:<10.4f}".format("Overall W per token:", overall_w_per_token))
     print("{:<40} {:<10.2f}".format("Total energy (J):", E_j))
     print("{:<40} {:<10.2f}".format("Average power (W):", avg_w))
 
@@ -583,8 +596,13 @@ async def benchmark(
     print("{:<40} {:<10}".format("Decode tokens:", decode_tokens))
     print("{:<40} {:<10.4f}".format("Prefill J per token:", prefill_j_per_token))
     print("{:<40} {:<10.4f}".format("Decode J per token:", decode_j_per_token))
-    
+
     print(f"Power Limits: Min={gpu_logger.min_power} W, Max={gpu_logger.max_power} W")
+
+    print(f"Number of big_inp_litl_out_counter is {big_inp_litl_out_counter}")
+    print(f"Number of litl_inp_big_out_counter is {litl_inp_big_out_counter}")
+    print(f"Mean number of prompt tokens per request: {cumulative_prompt_len/metrics.completed}")
+    print(f"Mean number of generated tokens per request: {cumulative_generated_len/metrics.completed}")
 
     result = {
         "duration": benchmark_duration,

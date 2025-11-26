@@ -10,7 +10,7 @@ echo "PBS_O_WORKDIR: $PBS_O_WORKDIR"
 module restore -f vllm
 module list
 source /home/users/ntu/n2402836/scratch/venv_adaspec/bin/activate
-echo "Virtual env: $$VIRTUAL_ENV"
+echo "Virtual env: $VIRTUAL_ENV"
 
 cd /home/users/ntu/n2402836/scratch/AdaSpec/scripts_e2e
 bash /home/users/ntu/n2402836/scratch/AdaSpec/scripts_e2e/3_run_smartspec_dynamic.sh
